@@ -1,43 +1,66 @@
+# Suppress deprecation warnings first
+import warnings
+warnings.simplefilter("ignore", FutureWarning)
+import importlib
 import pandas as pd
 import numpy as np
 import yfinance as yf
 import talib
-import mplfinance as mpf
-import matplotlib.pyplot as plt
-import schedule
-import time
-from datetime import datetime
 from sklearn.svm import SVC
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.metrics import classification_report
+from datetime import datetime
+import sys
+import os
+
+# --------------------------
+# 🔧 FORCE DEMO / PRACTICE MODE ONLY
+# --------------------------
+PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from config import DEMO_MODE, OANDA_ENV
+if not DEMO_MODE or OANDA_ENV.lower() != "practice":
+    print("="*70)
+    print("❌ ABORTED: REAL ACCOUNT DETECTED!")
+    print("⚠️  This script is locked to DEMO / PRACTICE account only.")
+    print("👉 Set DEMO_MODE=True and OANDA_ENV='practice' in config.py first.")
+    print("="*70)
+    sys.exit(1)
+print("✅ ✅ ✅ RUNNING IN DEMO / PRACTICE MODE — NO REAL FUNDS AT RISK ✅ ✅ ✅")
+
+# Import your existing modules
+from utils.oanda_execution import open_oanda_order, close_all_trades, api
+from telegram_message import send_telegram_message
 
 
 # ----------------------
-# ⚙️ GLOBAL CONFIG
+# ⚙️ CONFIG SETTINGS
 # ----------------------
 RUN_BACKTEST = True
-PLOT_EQUITY_CURVE = True
-PLOT_PRICE_WITH_SIGNALS = True
+PLOT_EQUITY_CURVE = False
+PLOT_PRICE_WITH_SIGNALS = False
 
-# Risk Settings
+# Risk Management
 RISK_PER_TRADE_PCT = 1.0
 REWARD_RATIO = 1.5
 SL_MULTIPLIER = 1.0
 TP_MULTIPLIER = 1.5
 SIGNAL_THRESHOLD = 0.55
+DEFAULT_TRADE_UNITS = 1000  # Small safe demo units
 
 # Trading Settings
-FOREX_PAIR = "USDJPY=X"       # "EURJPY=X" / "GBPJPY=X"
+FOREX_PAIR = "USDJPY=X"
 START_DATE = "2020-01-01"
-END_DATE = "2024-12-31"
+END_DATE = datetime.now().strftime("%Y-%m-%d")
 INITIAL_CAPITAL = 10000
 
-# Schedule Settings
-RUN_TIME = "06:30"            # Daily run time (SGT/UTC+8)
-RUN_FREQUENCY = "daily"       # Matches D1 training timeframe
+# Log file
+LOG_FILE = os.path.join(os.path.dirname(__file__), "forex_signals.log")
 
 
 # ----------------------
@@ -80,7 +103,7 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
 # ----------------------
 # 2. Data Preparation
 # ----------------------
-def prepare_forex_dataset(ticker, start, end, max_feature_lookback=20, max_label_lookahead=3, max_lag=3):
+def prepare_forex_dataset(ticker, start, end):
     print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Fetching data for {ticker}...")
     try:
         df = yf.download(ticker, start=start, end=end, progress=False)
@@ -97,22 +120,11 @@ def prepare_forex_dataset(ticker, start, end, max_feature_lookback=20, max_label
         return None, None
 
     close = np.asarray(df['Close']).ravel()
-    future_return = pd.Series(close).pct_change(max_label_lookahead).shift(-max_label_lookahead).values
+    future_return = pd.Series(close).pct_change(3).shift(-3).values
     df['future_return'] = future_return
     df['label'] = np.where(future_return > 0, 1, 0)
 
-    required_min_len = max_feature_lookback + max_lag + max_label_lookahead
-    if len(df) < required_min_len:
-        print(f"❌ Not enough data rows. Need at least {required_min_len}, got {len(df)}.")
-        return None, None
-
-    temp_sma = talib.SMA(close, timeperiod=max_feature_lookback + max_lag)
-    first_valid_idx = pd.Series(temp_sma, index=df.index).first_valid_index()
-    if first_valid_idx is None:
-        print("❌ Could not determine valid start index.")
-        return None, None
-
-    df_clean = df.loc[first_valid_idx:].dropna(subset=['future_return', 'label']).copy()
+    df_clean = df.dropna(subset=['future_return', 'label']).copy()
     if df_clean.empty:
         print("❌ No valid rows after cleaning.")
         return None, None
@@ -124,7 +136,7 @@ def prepare_forex_dataset(ticker, start, end, max_feature_lookback=20, max_label
 
 
 # ----------------------
-# 3. Core Functions
+# 3. Risk & Signal Functions
 # ----------------------
 def generate_signals(model, X_features, threshold=0.55):
     proba = model.predict_proba(X_features)[:, 1]
@@ -169,7 +181,7 @@ def get_live_trade_plan(ticker, model, fe, capital=10000, threshold=0.55):
 
         features = fe.transform(data).dropna()
         if features.empty:
-            return "❌ Not enough data to calculate features"
+            return "❌ *Not enough data to generate trade plan*"
 
         latest = features.tail(1)
         prob_up = model.predict_proba(latest)[0, 1]
@@ -178,96 +190,44 @@ def get_live_trade_plan(ticker, model, fe, capital=10000, threshold=0.55):
 
         if prob_up > threshold:
             risk = calculate_risk_levels(entry, atr, "long")
-            dir_text = "📈 BUY / LONG"
+            dir_text = "📈 *BUY / LONG*"
+            direction = "BUY"
         elif prob_up < (1 - threshold):
             risk = calculate_risk_levels(entry, atr, "short")
-            dir_text = "📉 SELL / SHORT"
+            dir_text = "📉 *SELL / SHORT*"
+            direction = "SELL"
         else:
             return f"""
---- {ticker} TRADE PLAN ({datetime.now().strftime('%Y-%m-%d')}) ---
+📊 *{ticker} TRADE PLAN*
+Date: {datetime.now().strftime('%Y-%m-%d')}
 Probability Up: {prob_up:.1%}
-Action: ⏸️ HOLD / NO TRADE
+Action: ⏸️ *HOLD / NO TRADE*
 Reason: Probability within neutral range
 """
 
         size = calculate_position_size(capital, RISK_PER_TRADE_PCT, risk["entry"], risk["stop_loss"])
         return f"""
-📊 {ticker} TRADE PLAN ({datetime.now().strftime('%Y-%m-%d')})
+📊 *{ticker} TRADE PLAN*
+Date: {datetime.now().strftime('%Y-%m-%d')}
 --------------------------------
 Probability Up: {prob_up:.1%}
 Direction: {dir_text}
-Entry Price: {risk['entry']}
-Stop-Loss: {risk['stop_loss']} ({risk['risk_pips']} pips risk)
-Take-Profit: {risk['take_profit']}
+Entry Price: `{risk['entry']}`
+Stop-Loss: `{risk['stop_loss']}` ({risk['risk_pips']} pips risk)
+Take-Profit: `{risk['take_profit']}`
 Risk/Reward Ratio: 1 : {REWARD_RATIO}
-Capital: ${capital:,.2f}
-Risk per Trade: {RISK_PER_TRADE_PCT}% = ${(capital * RISK_PER_TRADE_PCT / 100):.2f}
+Capital: `${capital:,.2f}`
+Risk per Trade: {RISK_PER_TRADE_PCT}% = `${(capital * RISK_PER_TRADE_PCT / 100):.2f}`
 Position Size: {size} units
-Potential Profit: ${(size * abs(risk['take_profit'] - risk['entry'])):.2f}
-"""
+Potential Profit: `${(size * abs(risk['take_profit'] - risk['entry'])):.2f}`
+""", direction, risk
+
     except Exception as e:
-        return f"❌ Error generating trade plan: {str(e)}"
+        return f"❌ *Error generating trade plan:* {str(e)}", None, None
 
 
 # ----------------------
-# 4. Plot Functions
-# ----------------------
-def plot_with_signals(df, signals, title="Price & Signals", rsi_period=14):
-    common_idx = df.index.intersection(signals.index)
-    if common_idx.empty:
-        print("⚠️ No overlapping data to plot")
-        return
-    df_plot = df.loc[common_idx].copy()
-    signals_aligned = signals.loc[common_idx]
-
-    close = np.asarray(df_plot['Close']).ravel()
-    df_plot['RSI'] = talib.RSI(close, timeperiod=rsi_period)
-
-    buy = pd.Series(np.nan, index=df_plot.index)
-    sell = pd.Series(np.nan, index=df_plot.index)
-    buy.loc[signals_aligned[signals_aligned == 1].index] = df_plot.loc[signals_aligned == 1, 'Close']
-    sell.loc[signals_aligned[signals_aligned == -1].index] = df_plot.loc[signals_aligned == -1, 'Close']
-
-    addplots = [
-        mpf.make_addplot(buy, type='scatter', marker='^', color='g', markersize=10, panel=0),
-        mpf.make_addplot(sell, type='scatter', marker='v', color='r', markersize=10, panel=0),
-        mpf.make_addplot(df_plot['RSI'], panel=2, color='purple', ylabel='RSI')
-    ]
-    plot_type = 'candle' if len(df_plot) < 800 else 'line'
-
-    try:
-        mpf.plot(
-            df_plot,
-            type=plot_type,
-            volume=True,
-            addplot=addplots,
-            title=title,
-            style='yahoo',
-            figsize=(12, 9),
-            panel_ratios=(3, 1, 1),
-            warn_too_much_data=2000
-        )
-    except Exception as e:
-        print(f"⚠️ Plot error: {e}")
-
-
-def plot_equity_curve(data, title="Strategy Equity Curve"):
-    try:
-        plt.figure(figsize=(12, 5))
-        plt.plot(data['equity'], label='Strategy Equity', color='blue', linewidth=2)
-        plt.title(title, fontsize=14)
-        plt.xlabel('Date')
-        plt.ylabel('Capital ($)')
-        plt.grid(alpha=0.3)
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-    except Exception as e:
-        print(f"⚠️ Equity plot error: {e}")
-
-
-# ----------------------
-# 5. Backtest Engine
+# 4. Backtest Function
 # ----------------------
 def backtest(df_price, signals, initial_capital=10000, fee_pct=0.0002):
     data = df_price.copy()
@@ -277,7 +237,7 @@ def backtest(df_price, signals, initial_capital=10000, fee_pct=0.0002):
     data['trade'] = data['position'].diff().abs()
     data['net_returns'] = data['position'] * data['returns'] - data['trade'] * fee_pct
     data['equity'] = initial_capital * (1 + data['net_returns']).cumprod()
-    data['equity'].iloc[0] = initial_capital
+    data.loc[data.index[0], 'equity'] = initial_capital
 
     total_return = (data['equity'].iloc[-1] / initial_capital) - 1
     buy_hold_return = (data['Close'].iloc[-1] / data['Close'].iloc[0]) - 1
@@ -286,39 +246,89 @@ def backtest(df_price, signals, initial_capital=10000, fee_pct=0.0002):
     num_trades = int(data['trade'].sum())
     win_rate = (data['net_returns'][data['net_returns'] != 0] > 0).mean() if num_trades > 0 else 0
 
-    metrics = {
+    return {
         'Initial Capital': f"${initial_capital:,.2f}",
         'Final Equity': f"${data['equity'].iloc[-1]:,.2f}",
-        'Total_strategy_return': f"{total_return:.2%}",
-        'buy_hold_return': f"{buy_hold_return:.2%}",
-        'max_drawdown': f"{max_drawdown:.2%}",
-        'num_trades': num_trades,
-        'win_rate': f"{win_rate:.2%}"
+        'Strategy Return': f"{total_return:.2%}",
+        'Buy & Hold': f"{buy_hold_return:.2%}",
+        'Max Drawdown': f"{max_drawdown:.2%}",
+        'Total Trades': num_trades,
+        'Win Rate': f"{win_rate:.2%}"
     }
-    return data, metrics
 
 
 # ----------------------
-# 6. Daily Job Function
+# 5. Execute DEMO Order + Notify
 # ----------------------
-def run_daily_job():
-    print(f"\n=========================================")
-    print(f"⏰ Running Daily Strategy @ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"=========================================")
+def execute_and_notify_demo_trade(direction: str, risk: dict):
+    """Execute order on DEMO account using your proven oanda_execution.py"""
+    pair = "USD_JPY"  # Matches OANDA format
+
+    # Build signal dict exactly as open_oanda_order expects
+    signal = {
+        "pair": pair,
+        "action": direction,
+        "stop_loss": risk["stop_loss"],
+        "take_profit": risk["take_profit"]
+    }
+
+    print(f"\n🚀 EXECUTING DEMO {direction} ORDER FOR {pair}...")
+    print(f"   Entry: {risk['entry']} | SL: {risk['stop_loss']} | TP: {risk['take_profit']}")
+
+    # Send order (safe demo mode)
+    result = open_oanda_order(signal, units=DEFAULT_TRADE_UNITS)
+
+    # Send Telegram alert
+    if result["status"] == "SUCCESS":
+        alert = f"""
+✅ *DEMO TRADE EXECUTED*
+🔹 Account: PRACTICE / DEMO
+🔹 Pair: {pair}
+🔹 Direction: {direction}
+🔹 Entry: `{result['filled_price']}`
+🔹 SL: `{result['sl_set']}`
+🔹 TP: `{result['tp_set']}`
+🔹 Units: {DEFAULT_TRADE_UNITS}
+🔹 Order ID: `{result['order_id']}`
+🔹 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+    else:
+        alert = f"""
+❌ *DEMO TRADE FAILED*
+🔹 Pair: {pair}
+🔹 Direction: {direction}
+🔹 Error: {result['message']}
+"""
+    print(alert)
+    send_telegram_message(alert)
+    return result
+
+
+# ----------------------
+# 6. Main Run
+# ----------------------
+def run_strategy():
+    print("\n=========================================")
+    print(f"⏰ Running Forex Strategy @ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=========================================")
 
     X_raw, y = prepare_forex_dataset(FOREX_PAIR, START_DATE, END_DATE)
-    # ✅ Fixed check for DataFrame/None
     if X_raw is None or y is None or X_raw.empty or y.empty:
-        print("❌ Could not proceed: invalid or empty dataset")
+        msg = "❌ Strategy failed: Could not load valid data"
+        print(msg)
+        send_telegram_message(msg)
         return
 
+    # Tune model with CalibratedClassifierCV
     best_score = -np.inf
     best_params = {}
+    base_svm = SVC(class_weight='balanced', random_state=42)
+    calibrated_svm = CalibratedClassifierCV(base_svm, ensemble=False)
     model = Pipeline([
         ('scaler', StandardScaler()),
-        ('svm', SVC(probability=True, class_weight='balanced', random_state=42))
+        ('svm', calibrated_svm)
     ])
-    param_grid = {'svm__C': [0.1, 1, 10], 'svm__kernel': ['linear', 'rbf']}
+    param_grid = {'svm__estimator__C': [0.1, 1, 10], 'svm__estimator__kernel': ['linear', 'rbf']}
     tscv = TimeSeriesSplit(n_splits=5)
 
     for tp in [10, 14, 20]:
@@ -330,73 +340,62 @@ def run_daily_job():
         Xc, yc = comb.drop(columns=['label']), comb['label']
         grid = GridSearchCV(model, param_grid, cv=tscv, scoring='f1', n_jobs=-1, verbose=0)
         grid.fit(Xc, yc)
-        print(f"TP={tp} | Best F1={grid.best_score_:.4f} | Params={grid.best_params_}")
+        print(f"TP={tp} | F1={grid.best_score_:.4f}")
         if grid.best_score_ > best_score:
             best_score = grid.best_score_
             best_params = {**grid.best_params_, 'rsi_timeperiod': tp}
 
     if not best_params:
-        print("❌ No valid model parameters found")
+        msg = "❌ Strategy failed: No valid model parameters found"
+        print(msg)
+        send_telegram_message(msg)
         return
 
+    # Train final calibrated model
     best_tp = best_params['rsi_timeperiod']
-    svm_args = {k.replace('svm__', ''): v for k, v in best_params.items() if k.startswith('svm__')}
+    svm_args = {k.replace('svm__estimator__', ''): v for k, v in best_params.items() if k.startswith('svm__estimator__')}
     fe_final = FeatureEngineer(timeperiod=best_tp)
-    X_final = fe_final.transform(X_raw)
-    data_final = pd.concat([X_final, y], axis=1).dropna()
-    if data_final.empty:
-        print("❌ No valid final data")
-        return
-
+    X_final = fe_final.transform(X_raw).dropna()
+    data_final = pd.concat([X_final, y.reindex(X_final.index)], axis=1).dropna()
     Xm, ym = data_final.drop(columns=['label']), data_final['label']
+
+    final_base = SVC(class_weight='balanced', random_state=42, **svm_args)
+    final_calibrated = CalibratedClassifierCV(final_base, ensemble=False)
     final_model = Pipeline([
         ('scaler', StandardScaler()),
-        ('svm', SVC(probability=True, class_weight='balanced', random_state=42, **svm_args))
+        ('svm', final_calibrated)
     ])
     final_model.fit(Xm, ym)
 
-    print("\n--- Classification Report ---")
-    print(classification_report(ym, final_model.predict(Xm)))
-
-    signals = generate_signals(final_model, Xm, threshold=SIGNAL_THRESHOLD)
-
-    if PLOT_PRICE_WITH_SIGNALS:
-        plot_with_signals(X_raw, signals, f"{FOREX_PAIR} Signals", best_tp)
-
+    # Backtest
     if RUN_BACKTEST:
-        bt_df, metrics = backtest(X_raw.loc[Xm.index], signals, INITIAL_CAPITAL)
+        signals = generate_signals(final_model, Xm, SIGNAL_THRESHOLD)
+        backtest_metrics = backtest(X_raw.loc[Xm.index], signals, INITIAL_CAPITAL)
         print("\n=== BACKTEST RESULTS ===")
-        for k, v in metrics.items():
+        for k, v in backtest_metrics.items():
             print(f"{k}: {v}")
-        if PLOT_EQUITY_CURVE:
-            plot_equity_curve(bt_df, f"{FOREX_PAIR} Strategy Equity")
 
-    trade_plan = get_live_trade_plan(FOREX_PAIR, final_model, fe_final, capital=INITIAL_CAPITAL, threshold=SIGNAL_THRESHOLD)
-    print(trade_plan)
+    # Get today's signal
+    trade_plan, direction, risk = get_live_trade_plan(FOREX_PAIR, final_model, fe_final, INITIAL_CAPITAL, SIGNAL_THRESHOLD)
+    print("\n" + trade_plan)
 
     # Save to log
-    try:
-        with open("forex_signals.log", "a", encoding="utf-8") as f:
-            f.write(f"\n[{datetime.now()}]\n{trade_plan}\n")
-    except Exception as e:
-        print(f"⚠️ Could not write to log: {e}")
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"\n[{datetime.now()}]\n{trade_plan}\n{'-'*50}\n")
+
+    # Send plan to Telegram
+    send_telegram_message(trade_plan)
+
+    # --------------------------
+    # 🚀 EXECUTE DEMO ORDER IF VALID SIGNAL
+    # --------------------------
+    if direction in ["BUY", "SELL"] and risk:
+        execute_and_notify_demo_trade(direction, risk)
+    else:
+        print("\n⏸️ No valid BUY/SELL signal — no order executed.")
+
+    return trade_plan
 
 
-# ----------------------
-# 7. Scheduler Setup
-# ----------------------
-def start_scheduler():
-    print(f"\n✅ Scheduler started. Will run every day at {RUN_TIME} SGT.")
-    print("Press Ctrl+C to stop.\n")
-    schedule.every().day.at(RUN_TIME).do(run_daily_job)
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
-
-
-# ----------------------
-# Run Once or Start Scheduler
-# ----------------------
 if __name__ == "__main__":
-    run_daily_job()
-    start_scheduler()
+    run_strategy()
