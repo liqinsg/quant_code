@@ -41,6 +41,7 @@ virtualenv/
 # ----------------------
 # Logs & Outputs
 # ----------------------
+logs/
 *.log
 forex_signals.log
 forex_cron.log
