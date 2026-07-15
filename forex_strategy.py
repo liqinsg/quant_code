@@ -1,6 +1,7 @@
 # Suppress deprecation warnings first
 import warnings
 warnings.simplefilter("ignore", FutureWarning)
+import importlib
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -12,9 +13,28 @@ from sklearn.pipeline import Pipeline
 from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
 from sklearn.base import BaseEstimator, TransformerMixin
 from datetime import datetime
+import sys
 import os
 
-# Import your separate Telegram module
+# --------------------------
+# 🔧 FORCE DEMO / PRACTICE MODE ONLY
+# --------------------------
+PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from config import DEMO_MODE, OANDA_ENV
+if not DEMO_MODE or OANDA_ENV.lower() != "practice":
+    print("="*70)
+    print("❌ ABORTED: REAL ACCOUNT DETECTED!")
+    print("⚠️  This script is locked to DEMO / PRACTICE account only.")
+    print("👉 Set DEMO_MODE=True and OANDA_ENV='practice' in config.py first.")
+    print("="*70)
+    sys.exit(1)
+print("✅ ✅ ✅ RUNNING IN DEMO / PRACTICE MODE — NO REAL FUNDS AT RISK ✅ ✅ ✅")
+
+# Import your existing modules
+from utils.oanda_execution import open_oanda_order, close_all_trades, api
 from telegram_message import send_telegram_message
 
 
@@ -31,6 +51,7 @@ REWARD_RATIO = 1.5
 SL_MULTIPLIER = 1.0
 TP_MULTIPLIER = 1.5
 SIGNAL_THRESHOLD = 0.55
+DEFAULT_TRADE_UNITS = 1000  # Small safe demo units
 
 # Trading Settings
 FOREX_PAIR = "USDJPY=X"
@@ -170,9 +191,11 @@ def get_live_trade_plan(ticker, model, fe, capital=10000, threshold=0.55):
         if prob_up > threshold:
             risk = calculate_risk_levels(entry, atr, "long")
             dir_text = "📈 *BUY / LONG*"
+            direction = "BUY"
         elif prob_up < (1 - threshold):
             risk = calculate_risk_levels(entry, atr, "short")
             dir_text = "📉 *SELL / SHORT*"
+            direction = "SELL"
         else:
             return f"""
 📊 *{ticker} TRADE PLAN*
@@ -197,9 +220,10 @@ Capital: `${capital:,.2f}`
 Risk per Trade: {RISK_PER_TRADE_PCT}% = `${(capital * RISK_PER_TRADE_PCT / 100):.2f}`
 Position Size: {size} units
 Potential Profit: `${(size * abs(risk['take_profit'] - risk['entry'])):.2f}`
-"""
+""", direction, risk
+
     except Exception as e:
-        return f"❌ *Error generating trade plan:* {str(e)}"
+        return f"❌ *Error generating trade plan:* {str(e)}", None, None
 
 
 # ----------------------
@@ -213,7 +237,6 @@ def backtest(df_price, signals, initial_capital=10000, fee_pct=0.0002):
     data['trade'] = data['position'].diff().abs()
     data['net_returns'] = data['position'] * data['returns'] - data['trade'] * fee_pct
     data['equity'] = initial_capital * (1 + data['net_returns']).cumprod()
-    # data['equity'].iloc[0] = initial_capital
     data.loc[data.index[0], 'equity'] = initial_capital
 
     total_return = (data['equity'].iloc[-1] / initial_capital) - 1
@@ -235,7 +258,54 @@ def backtest(df_price, signals, initial_capital=10000, fee_pct=0.0002):
 
 
 # ----------------------
-# 5. Main Run
+# 5. Execute DEMO Order + Notify
+# ----------------------
+def execute_and_notify_demo_trade(direction: str, risk: dict):
+    """Execute order on DEMO account using your proven oanda_execution.py"""
+    pair = "USD_JPY"  # Matches OANDA format
+
+    # Build signal dict exactly as open_oanda_order expects
+    signal = {
+        "pair": pair,
+        "action": direction,
+        "stop_loss": risk["stop_loss"],
+        "take_profit": risk["take_profit"]
+    }
+
+    print(f"\n🚀 EXECUTING DEMO {direction} ORDER FOR {pair}...")
+    print(f"   Entry: {risk['entry']} | SL: {risk['stop_loss']} | TP: {risk['take_profit']}")
+
+    # Send order (safe demo mode)
+    result = open_oanda_order(signal, units=DEFAULT_TRADE_UNITS)
+
+    # Send Telegram alert
+    if result["status"] == "SUCCESS":
+        alert = f"""
+✅ *DEMO TRADE EXECUTED*
+🔹 Account: PRACTICE / DEMO
+🔹 Pair: {pair}
+🔹 Direction: {direction}
+🔹 Entry: `{result['filled_price']}`
+🔹 SL: `{result['sl_set']}`
+🔹 TP: `{result['tp_set']}`
+🔹 Units: {DEFAULT_TRADE_UNITS}
+🔹 Order ID: `{result['order_id']}`
+🔹 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+    else:
+        alert = f"""
+❌ *DEMO TRADE FAILED*
+🔹 Pair: {pair}
+🔹 Direction: {direction}
+🔹 Error: {result['message']}
+"""
+    print(alert)
+    send_telegram_message(alert)
+    return result
+
+
+# ----------------------
+# 6. Main Run
 # ----------------------
 def run_strategy():
     print("\n=========================================")
@@ -306,15 +376,23 @@ def run_strategy():
             print(f"{k}: {v}")
 
     # Get today's signal
-    trade_plan = get_live_trade_plan(FOREX_PAIR, final_model, fe_final, INITIAL_CAPITAL, SIGNAL_THRESHOLD)
+    trade_plan, direction, risk = get_live_trade_plan(FOREX_PAIR, final_model, fe_final, INITIAL_CAPITAL, SIGNAL_THRESHOLD)
     print("\n" + trade_plan)
 
     # Save to log
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(f"\n[{datetime.now()}]\n{trade_plan}\n{'-'*50}\n")
 
-    # Send to Telegram
+    # Send plan to Telegram
     send_telegram_message(trade_plan)
+
+    # --------------------------
+    # 🚀 EXECUTE DEMO ORDER IF VALID SIGNAL
+    # --------------------------
+    if direction in ["BUY", "SELL"] and risk:
+        execute_and_notify_demo_trade(direction, risk)
+    else:
+        print("\n⏸️ No valid BUY/SELL signal — no order executed.")
 
     return trade_plan
 

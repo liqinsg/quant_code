@@ -1,0 +1,5 @@
+[GEMINI] News filter disabled via config or missing API key
+Traceback (most recent call last):
+  File "/home/nie/projects/quant_code/forex_strategy.py", line 16, in <module>
+    from utils.trading_core import execute_market_trade, has_open_position
+ImportError: cannot import name 'has_open_position' from 'utils.trading_core' (/home/nie/projects/quant_code/utils/trading_core.py). Did you mean: 'get_open_position'?
