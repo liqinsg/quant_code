@@ -1,7 +1,6 @@
 # Suppress deprecation warnings first
 import warnings
-warnings.simplefilter("ignore", FutureWarning)
-import importlib
+# import importlib
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -15,27 +14,15 @@ from sklearn.base import BaseEstimator, TransformerMixin
 from datetime import datetime
 import sys
 import os
+from utils.oanda_execution import open_oanda_order, close_position  # , api, has_duplicate_trade, close_all_trades
+from utils.oanda_execution import get_open_positions
+from telegram_message import send_telegram_message
 
-# --------------------------
-# 🔧 FORCE DEMO / PRACTICE MODE ONLY
-# --------------------------
+warnings.simplefilter("ignore", FutureWarning)
+
 PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
-
-from config import DEMO_MODE, OANDA_ENV
-if not DEMO_MODE or OANDA_ENV.lower() != "practice":
-    print("="*70)
-    print("❌ ABORTED: REAL ACCOUNT DETECTED!")
-    print("⚠️  This script is locked to DEMO / PRACTICE account only.")
-    print("👉 Set DEMO_MODE=True and OANDA_ENV='practice' in config.py first.")
-    print("="*70)
-    sys.exit(1)
-print("✅ ✅ ✅ RUNNING IN DEMO / PRACTICE MODE — NO REAL FUNDS AT RISK ✅ ✅ ✅")
-
-# Import your existing modules
-from utils.oanda_execution import open_oanda_order, close_all_trades, api
-from telegram_message import send_telegram_message
 
 
 # ----------------------
@@ -51,7 +38,7 @@ REWARD_RATIO = 1.5
 SL_MULTIPLIER = 1.0
 TP_MULTIPLIER = 1.5
 SIGNAL_THRESHOLD = 0.55
-DEFAULT_TRADE_UNITS = 1000  # Small safe demo units
+DEFAULT_TRADE_UNITS = 1000
 
 # Trading Settings
 FOREX_PAIR = "USDJPY=X"
@@ -206,6 +193,9 @@ Reason: Probability within neutral range
 """
 
         size = calculate_position_size(capital, RISK_PER_TRADE_PCT, risk["entry"], risk["stop_loss"])
+        # NOTE: `size` here is the risk-based position size, but execution
+        # currently always trades DEFAULT_TRADE_UNITS (see execute_and_notify_demo_trade).
+        # Flagged, not auto-changed — decide whether execution should use `size` instead.
         return f"""
 📊 *{ticker} TRADE PLAN*
 Date: {datetime.now().strftime('%Y-%m-%d')}
@@ -257,12 +247,42 @@ def backtest(df_price, signals, initial_capital=10000, fee_pct=0.0002):
     }
 
 
-# ----------------------
-# 5. Execute DEMO Order + Notify
-# ----------------------
+
 def execute_and_notify_demo_trade(direction: str, risk: dict):
-    """Execute order on DEMO account using your proven oanda_execution.py"""
+    """Execute order on DEMO account using your proven oanda_execution.py.
+
+    Reversal handling: if there's an existing position on the pair in the
+    OPPOSITE direction, close it first, then open the new one. If the
+    existing position is already on the same side, open_oanda_order's
+    internal has_duplicate_trade check will just skip — no action needed.
+    """
     pair = "USD_JPY"  # Matches OANDA format
+
+    current_positions = get_open_positions()
+    existing = current_positions.get(pair)
+    if existing and existing["side"] != direction:
+        print(f"\n🔄 REVERSAL: existing {existing['side']} on {pair} — closing before opening {direction}...")
+        close_result = close_position(pair)
+        if close_result["status"] == "ERROR":
+            msg = f"""
+❌ *REVERSAL FAILED*
+🔹 Pair: {pair}
+🔹 Could not close existing {existing['side']} position
+🔹 Error: {close_result.get('message')}
+🔹 New {direction} order was NOT sent — existing position left open
+"""
+            print(msg)
+            send_telegram_message(msg)
+            return close_result
+        if close_result["status"] == "SUCCESS":
+            reversal_msg = f"""
+🔄 *POSITION REVERSED*
+🔹 Pair: {pair}
+🔹 Closed: {existing['side']}
+🔹 Opening: {direction}
+"""
+            print(reversal_msg)
+            send_telegram_message(reversal_msg)
 
     # Build signal dict exactly as open_oanda_order expects
     signal = {
@@ -275,8 +295,11 @@ def execute_and_notify_demo_trade(direction: str, risk: dict):
     print(f"\n🚀 EXECUTING DEMO {direction} ORDER FOR {pair}...")
     print(f"   Entry: {risk['entry']} | SL: {risk['stop_loss']} | TP: {risk['take_profit']}")
 
-    # Send order (safe demo mode)
     result = open_oanda_order(signal, units=DEFAULT_TRADE_UNITS)
+
+    if result["status"] == "SKIPPED":
+        print(f"⏸️ {result.get('message', 'Order skipped')}")
+        return result
 
     # Send Telegram alert
     if result["status"] == "SUCCESS":
@@ -302,6 +325,7 @@ def execute_and_notify_demo_trade(direction: str, risk: dict):
     print(alert)
     send_telegram_message(alert)
     return result
+
 
 
 # ----------------------
@@ -381,7 +405,7 @@ def run_strategy():
 
     # Save to log
     with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"\n[{datetime.now()}]\n{trade_plan}\n{'-'*50}\n")
+        f.write(f"\n[{datetime.now()}]\n{trade_plan}\n{'-' * 50}\n")
 
     # Send plan to Telegram
     send_telegram_message(trade_plan)

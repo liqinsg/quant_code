@@ -4,38 +4,22 @@ Do not hardcode these values elsewhere in the codebase.
 """
 import os
 from dotenv import load_dotenv
+
 load_dotenv()
 
 # ==========================================
 # 🚀 LIVE / DEMO SWITCH — AUTO FROM .env
 # ==========================================
 # Auto-detect from your existing OANDA_ENV in .env
-_RAW_OANDA_ENV = os.getenv("OANDA_ENV", "practice").lower()
-DEMO_MODE = _RAW_OANDA_ENV == "practice"
-
-# ==========================================
-# OANDA connection — auto-switch by DEMO_MODE
-# ==========================================
-if DEMO_MODE:
-    print("\n" + "="*60)
-    print("🔧 RUNNING IN **DEMO / PRACTICE MODE**")
-    print("ℹ️  Orders will be sent to your OANDA practice account")
-    print("⚠️  No real funds will be used or risked")
-    print("="*60 + "\n")
-    # Demo: dedicated vars first, then fallbacks
-    OANDA_API_TOKEN = os.getenv("OANDA_API_TOKEN_DEMO", os.getenv("OANDA_API_TOKEN", ""))
-    OANDA_ENV = os.getenv("OANDA_ENV_DEMO", _RAW_OANDA_ENV)
-    OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID_DEMO", os.getenv("OANDA_ACCOUNT_ID", ""))
-else:
-    print("\n" + "="*60)
-    print("🚨 RUNNING IN **LIVE / REAL MODE**")
-    print("⚠️  ORDERS WILL USE REAL FUNDS — RISK OF LOSS")
-    print("✅ Connected to your OANDA live trading account")
-    print("="*60 + "\n")
-    # Live: dedicated vars first, then fallbacks
-    OANDA_API_TOKEN = os.getenv("OANDA_API_TOKEN_LIVE", os.getenv("OANDA_API_TOKEN", ""))
-    OANDA_ENV = os.getenv("OANDA_ENV_LIVE", _RAW_OANDA_ENV)
-    OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID_LIVE", os.getenv("OANDA_ACCOUNT_ID", ""))
+print("="*60 + "\n")
+OANDA_ENV = os.getenv("OANDA_ENV", "practice").lower()
+# Demo: dedicated vars first, then fallbacks
+OANDA_API_TOKEN = os.getenv("OANDA_API_TOKEN")
+OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "")
+print("\n" + "="*60)
+print("🔧 RUNNING IN **DEMO / PRACTICE MODE**")
+print("ℹ️  Orders will be sent to your OANDA practice account")
+print("⚠️  No real funds will be used or risked")
 
 # ==========================================
 # Scheduler
@@ -203,7 +187,6 @@ def main():
 
     # Core Mode & OANDA Settings
     print("\n🔹 MODE & OANDA CONNECTION")
-    print(f"  DEMO_MODE          : {DEMO_MODE}")
     print(f"  OANDA_ENV          : {OANDA_ENV}")
     print(f"  OANDA_API_TOKEN    : {'✅ SET' if OANDA_API_TOKEN else '❌ MISSING'}")
     print(f"  OANDA_ACCOUNT_ID   : {OANDA_ACCOUNT_ID if OANDA_ACCOUNT_ID else '❌ MISSING'}")

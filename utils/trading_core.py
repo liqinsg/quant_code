@@ -104,9 +104,18 @@ def execute_market_trade(signal, units_override=None):
     if not signal or signal.action == "HOLD":
         print("[EXEC] No action")
         return
-    if get_open_position(signal.pair_to_trade):
-        print("[EXEC] Already have position")
+
+    existing_direction = get_position_direction(
+        signal.pair_to_trade
+    )
+
+    if existing_direction == signal.action:
+        print(
+            f"[EXEC] Existing {existing_direction} "
+            f"position on {signal.pair_to_trade}. Skip."
+        )
         return
+
     pricing_mod = importlib.import_module("oandapyV20.endpoints.pricing")
     try:
         resp = oanda_client.request(pricing_mod.PricingInfo(OANDA_ACCOUNT_ID, {"instruments": signal.pair_to_trade})).response
@@ -279,3 +288,20 @@ def get_latest_price(instrument: str) -> float | None:
     except Exception as e:
         print(f"[OANDA] Error fetching price: {str(e)}")
         return None
+    
+def get_position_direction(instrument: str):
+    position = get_open_position(instrument)
+
+    if not position:
+        return None
+
+    long_units = int(position.get("long", {}).get("units", "0"))
+    short_units = int(position.get("short", {}).get("units", "0"))
+
+    if long_units > 0:
+        return "BUY"
+
+    if short_units < 0:
+        return "SELL"
+
+    return None
